@@ -26,6 +26,7 @@ import java.util.concurrent.Executors
 
 class MainActivity : AppCompatActivity() {
     private lateinit var manager: AbsAdbConnectionManager
+    private lateinit var vault: AnomalyVault
     private lateinit var status: TextView
     private lateinit var codeInput: EditText
     private lateinit var output: TextView
@@ -41,6 +42,8 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        vault = AnomalyVault(this)
+        vault.record("app_launch", JSONObject().put("version", "0.1.2"))
         manager = AdbConnectionManager.getInstance(this)
         acquireMulticastLock()
         setContentView(buildUi())
@@ -125,24 +128,31 @@ class MainActivity : AppCompatActivity() {
     private fun pairUsingCode() {
         val code = codeInput.text.toString().trim()
         if (!code.matches(Regex("\\d{6}"))) {
+            vault.record("pair_rejected_invalid_code_format")
             setStatus("Enter the six-digit code while the Android pairing dialog is still open")
             return
         }
+        vault.record("pair_start")
         pairButton.isEnabled = false
         setStatus("Discovering the temporary ADB pairing service… keep the pairing dialog open")
         pairingMdns?.stop()
         pairingMdns = AdbMdns(this, AdbMdns.SERVICE_TYPE_TLS_PAIRING) { host: InetAddress?, port: Int, _: String? ->
             if (host != null && port > 0) {
                 pairingMdns?.stop()
+                vault.record("pair_service_discovered", JSONObject().put("host", host.hostAddress ?: "").put("port", port))
                 executor.execute {
                     try {
                         setStatusUi("Pairing with ${host.hostAddress}:$port…")
                         manager.pair(host.hostAddress ?: "127.0.0.1", port, code)
+                        vault.record("pair_success", JSONObject().put("host", host.hostAddress ?: "").put("port", port))
                         setStatusUi("Paired. Connecting to Wireless ADB…")
                         val connected = manager.connectTls(this, 12_000)
-                        setStatusUi(if (connected || manager.isConnected) "Connected to your phone over Wireless ADB ✅" else "Paired, but connection did not establish")
+                        val isUp = connected || manager.isConnected
+                        vault.record("adb_connect_after_pair", JSONObject().put("connected", isUp))
+                        setStatusUi(if (isUp) "Connected to your phone over Wireless ADB ✅" else "Paired, but connection did not establish")
                         runOnUiThread { pairButton.isEnabled = true }
                     } catch (t: Throwable) {
+                        vault.recordThrowable("pair_connect_error", t, JSONObject().put("host", host.hostAddress ?: "").put("port", port))
                         setStatusUi("Pair/connect error: ${t.message}")
                         appendUi("${t.javaClass.simpleName}: ${t.message}\n")
                         runOnUiThread { pairButton.isEnabled = true }
@@ -154,6 +164,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun connectAndScan() {
         scanButton.isEnabled = false
+        vault.record("scan_start", JSONObject().put("alreadyConnected", manager.isConnected))
         executor.execute {
             try {
                 if (!manager.isConnected) {
@@ -170,9 +181,11 @@ class MainActivity : AppCompatActivity() {
                 }
                 appendUi(lines)
                 val hasWorkday = targets.any { it.url.contains("workday", true) || it.title.contains("Patient Service", true) }
+                vault.record("scan_complete", JSONObject().put("targetCount", targets.size).put("workdayFound", hasWorkday).put("socketCount", targets.map { it.socket }.distinct().size))
                 setStatusUi(if (hasWorkday) "Workday target found 🎯" else "Chrome scanned. No obvious Workday target yet.")
                 runOnUiThread { recoverButton.isEnabled = hasWorkday }
             } catch (t: Throwable) {
+                vault.recordThrowable("scan_error", t)
                 setStatusUi("Scan failed: ${t.message}")
                 appendUi("${t.javaClass.simpleName}: ${t.stackTraceToString()}\n")
             } finally {
@@ -183,6 +196,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun recoverWorkday() {
         recoverButton.isEnabled = false
+        vault.record("recovery_start", JSONObject().put("candidateCount", targets.count { it.url.contains("workday", true) || it.title.contains("Patient Service", true) }))
         executor.execute {
             try {
                 val candidates = targets.filter { it.url.contains("workday", true) || it.title.contains("Patient Service", true) }
@@ -193,21 +207,26 @@ class MainActivity : AppCompatActivity() {
                 candidates.forEach { target ->
                     runCatching { engine.recover(target) }
                         .onSuccess { recovered.put(it) }
-                        .onFailure { recovered.put(JSONObject().put("targetUrl", target.url).put("error", it.toString())) }
+                        .onFailure {
+                            vault.recordThrowable("recovery_target_error", it, JSONObject().put("socket", target.socket).put("title", target.title.take(200)))
+                            recovered.put(JSONObject().put("targetUrl", target.url).put("error", it.toString()))
+                        }
                 }
                 val root = JSONObject().apply {
                     put("tool", "Aria Bridge Lite")
-                    put("version", "0.1.0")
+                    put("version", "0.1.2")
                     put("note", "Read-only capture of the currently live Workday Chrome target(s).")
                     put("targets", recovered)
                 }
                 val file = File(filesDir, "workday_recovery_${System.currentTimeMillis()}.json")
                 file.writeText(root.toString(2))
                 lastRecoveryFile = file
+                vault.record("recovery_complete", JSONObject().put("recoveredTargets", recovered.length()).put("outputBytes", file.length()))
                 appendUi("\n===== RECOVERY =====\n${root.toString(2)}\n")
                 setStatusUi("Recovery capture complete ✅  ${file.name}")
                 runOnUiThread { shareButton.isEnabled = true }
             } catch (t: Throwable) {
+                vault.recordThrowable("recovery_error", t)
                 setStatusUi("Recovery failed: ${t.message}")
                 appendUi("${t.javaClass.simpleName}: ${t.stackTraceToString()}\n")
             } finally {
@@ -239,6 +258,7 @@ class MainActivity : AppCompatActivity() {
     private fun appendUi(text: String) = runOnUiThread { output.append(text) }
 
     override fun onDestroy() {
+        vault.record("app_destroy")
         pairingMdns?.stop()
         runCatching { multicastLock?.release() }
         executor.shutdownNow()
