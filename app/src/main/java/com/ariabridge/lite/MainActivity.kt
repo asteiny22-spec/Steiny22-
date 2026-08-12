@@ -113,7 +113,7 @@ class MainActivity : AppCompatActivity() {
 
         output = TextView(this).apply {
             text = "Output will appear here.\n"
-            textIsSelectable = true
+            setTextIsSelectable(true)
             textSize = 13f
             setPadding(0, 18, 0, 80)
         }
