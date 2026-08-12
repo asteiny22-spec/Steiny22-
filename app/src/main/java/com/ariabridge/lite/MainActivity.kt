@@ -43,7 +43,7 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         vault = AnomalyVault(this)
-        vault.record("app_launch", JSONObject().put("version", "0.1.2"))
+        vault.record("app_launch", JSONObject().put("version", "0.1.3"))
         manager = AdbConnectionManager.getInstance(this)
         acquireMulticastLock()
         setContentView(buildUi())
@@ -214,7 +214,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 val root = JSONObject().apply {
                     put("tool", "Aria Bridge Lite")
-                    put("version", "0.1.2")
+                    put("version", "0.1.3")
                     put("note", "Read-only capture of the currently live Workday Chrome target(s).")
                     put("targets", recovered)
                 }
