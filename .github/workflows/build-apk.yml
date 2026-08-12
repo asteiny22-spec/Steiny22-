@@ -18,6 +18,13 @@ jobs:
         run: |
           mkdir -p vendor
           git clone --depth 1 https://github.com/DP-Hridayan/aShellYou.git vendor/aShellYou
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("vendor/aShellYou/libadb/build.gradle.kts")
+          s = p.read_text()
+          s = s.replace('alias(libs.plugins.android.library)', 'id("com.android.library")')
+          p.write_text(s)
+          PY
 
       - name: Set up Java 17
         uses: actions/setup-java@v4
