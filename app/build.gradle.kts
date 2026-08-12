@@ -11,8 +11,8 @@ android {
         applicationId = "com.ariabridge.lite"
         minSdk = 28
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.1.1"
     }
 
     buildTypes {
@@ -36,4 +36,8 @@ dependencies {
     implementation("com.google.android.material:material:1.12.0")
     implementation("com.github.MuntashirAkon:sun-security-android:1.1")
     implementation("org.lsposed.hiddenapibypass:hiddenapibypass:6.1")
+
+    // Force libadb onto the bundled Conscrypt provider instead of Android 16's
+    // platform-private Conscrypt API, whose exportKeyingMaterial signature changed.
+    implementation("org.conscrypt:conscrypt-android:2.5.2")
 }
