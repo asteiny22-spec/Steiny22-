@@ -1,5 +1,6 @@
 package com.ariabridge.lite
 
+import android.os.SystemClock
 import io.github.muntashirakon.adb.AbsAdbConnectionManager
 import io.github.muntashirakon.adb.LocalServices
 import org.json.JSONArray
@@ -11,27 +12,40 @@ class RecoveryEngine(private val manager: AbsAdbConnectionManager) {
     data class Target(val socket: String, val id: String, val title: String, val url: String, val wsUrl: String)
 
     fun discoverChromeSockets(): List<String> {
-        val stream = manager.openStream("shell:cat /proc/net/unix | grep chrome_devtools_remote")
-        val text = stream.openInputStream().use { readAllText(it, 500_000) }
-        try { stream.close() } catch (_: Throwable) {}
-        return Regex("@?(chrome_devtools_remote(?:_[0-9]+)?)")
-            .findAll(text)
-            .map { it.groupValues[1] }
-            .distinct()
-            .toList()
+        val discovered = runCatching {
+            val stream = manager.openStream("shell:cat /proc/net/unix | grep chrome_devtools_remote; exit")
+            val text = stream.openInputStream().use {
+                readBounded(it, max = 500_000, firstByteTimeoutMs = 2_500, idleTimeoutMs = 250)
+            }
+            runCatching { stream.close() }
+            Regex("@?(chrome_devtools_remote(?:_[0-9]+)?)")
+                .findAll(text)
+                .map { it.groupValues[1] }
+                .distinct()
+                .toList()
+        }.getOrElse { emptyList() }
+
+        // Always try the standard Chrome socket even if /proc discovery is slow or restricted.
+        return (listOf("chrome_devtools_remote") + discovered).distinct()
     }
 
     fun listTargets(): List<Target> {
         val all = mutableListOf<Target>()
-        for (socket in discoverChromeSockets().ifEmpty { listOf("chrome_devtools_remote") }) {
-            val raw = httpGet(socket, "/json/list")
+        for (socket in discoverChromeSockets()) {
+            val raw = runCatching { httpGet(socket, "/json/list") }.getOrNull() ?: continue
             val body = raw.substringAfter("\r\n\r\n", raw)
             val array = runCatching { JSONArray(body) }.getOrNull() ?: continue
             for (i in 0 until array.length()) {
                 val o = array.optJSONObject(i) ?: continue
                 val ws = o.optString("webSocketDebuggerUrl")
                 if (ws.isBlank()) continue
-                all += Target(socket, o.optString("id"), o.optString("title"), o.optString("url"), ws)
+                all += Target(
+                    socket = socket,
+                    id = o.optString("id"),
+                    title = o.optString("title"),
+                    url = o.optString("url"),
+                    wsUrl = ws
+                )
             }
         }
         return all.distinctBy { it.id to it.socket }
@@ -72,25 +86,50 @@ class RecoveryEngine(private val manager: AbsAdbConnectionManager) {
 
     private fun httpGet(socket: String, path: String): String {
         val stream = manager.openStream(LocalServices.LOCAL_UNIX_SOCKET_ABSTRACT, socket)
-        val out = stream.openOutputStream()
-        val input = stream.openInputStream()
-        val request = "GET $path HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-        out.write(request.toByteArray())
-        out.flush()
-        val result = readAllText(input, 4_000_000)
-        try { stream.close() } catch (_: Throwable) {}
-        return result
+        try {
+            val out = stream.openOutputStream()
+            val input = stream.openInputStream()
+            val request = "GET $path HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            out.write(request.toByteArray())
+            out.flush()
+            return readBounded(input, max = 4_000_000, firstByteTimeoutMs = 4_000, idleTimeoutMs = 600)
+        } finally {
+            runCatching { stream.close() }
+        }
     }
 
-    private fun readAllText(input: InputStream, max: Int): String {
+    /**
+     * Reads only bytes that are already available and stops on a first-byte or idle deadline.
+     * This avoids an Android ADB stream blocking forever when the peer keeps the channel open.
+     */
+    private fun readBounded(
+        input: InputStream,
+        max: Int,
+        firstByteTimeoutMs: Long,
+        idleTimeoutMs: Long
+    ): String {
         val out = ByteArrayOutputStream()
         val buffer = ByteArray(8192)
+        val started = SystemClock.elapsedRealtime()
+        var lastData = started
+        var receivedAny = false
+
         while (out.size() < max) {
-            val n = try { input.read(buffer) } catch (e: java.io.IOException) {
-                if (out.size() > 0) break else throw e
+            val available = runCatching { input.available() }.getOrDefault(0)
+            if (available > 0) {
+                val wanted = minOf(buffer.size, available, max - out.size())
+                val n = runCatching { input.read(buffer, 0, wanted) }.getOrElse { -1 }
+                if (n <= 0) break
+                out.write(buffer, 0, n)
+                receivedAny = true
+                lastData = SystemClock.elapsedRealtime()
+                continue
             }
-            if (n <= 0) break
-            out.write(buffer, 0, minOf(n, max - out.size()))
+
+            val now = SystemClock.elapsedRealtime()
+            if (!receivedAny && now - started >= firstByteTimeoutMs) break
+            if (receivedAny && now - lastData >= idleTimeoutMs) break
+            SystemClock.sleep(25)
         }
         return out.toString(Charsets.UTF_8.name())
     }
